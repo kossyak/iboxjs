@@ -63,6 +63,81 @@ messenger.emit('request_data', { id: 123 })
 
 ---
 
+## Request-Response Pattern (call)
+In addition to standard event emitting, ibox supports a Promise-based RPC (Remote Procedure Call) pattern. This allows you to send a message and wait for a specific response from the other side.
+1. Setup a Listener (Receiver)
+   The side that receives the call must return a value (or a Promise) inside the on handler.
+```javascript
+   // Inside the Iframe (Client)
+   messenger.on('get_user_name', async (userId) => {
+       // You can perform async operations here
+       const user = await db.find(userId)
+       return user.name; // This value will be sent back to the Host
+   })
+```
+
+2. Make a Call (Sender)
+   The side that initiates the request uses the call method, which returns a Promise.
+```javascript
+   // Inside the Main App (Host)
+   try {
+       // messenger.call(eventName, data, timeoutMs)
+       const name = await messenger.call('get_user_name', 123);
+       console.log('Received from iframe:', name);
+   } catch (error) {
+       // Handle timeout or connection errors
+       console.error('Request failed:', error.message);
+   }
+````
+
+### API Details for call:
+messenger.call(event, data, timeout)
+- event (string): The name of the event to trigger.
+- data (any): Data to send to the listener.
+- timeout (number, optional): Time in milliseconds to wait for a response before rejecting the promise. Default: 5000ms.
+
+---
+
+## Integration with JS Modules
+
+If you are using `<script type="module">` for your application logic, global variables are not automatically scoped to the module. You should access the library via the `window` object:
+
+```javascript
+// Inside your report.js (type="module")
+const messenger = window.ibox.host(iframe, 'https://child-app.com')
+```
+For standard scripts (without type="module"), you can continue using the shorthand:
+```javascript
+const messenger = ibox.host(iframe, 'https://child-app.com');
+```
+
+---
+
+## Recommended Iframe Configuration
+For maximum security and stability of your microservice, use the following attributes when defining your iframe. The ibox library requires at least allow-scripts to function.
+```html
+<iframe
+    src="https://child-app.com"
+    title="Microservice Name"
+    
+    /* Security: Essential for ibox to work safely */
+    sandbox="allow-scripts allow-same-origin allow-forms"
+    
+    /* Permissions: Grant access to specific browser APIs if needed */
+    allow="geolocation; camera; microphone"
+    
+    /* Privacy: Controls how much info is sent in the Referer header */
+    referrerpolicy="strict-origin-when-cross-origin"
+    
+    /* Performance: Use 'eager' for immediate or 'lazy' for deferred loading */
+    loading="eager"
+    
+    style="border: none; width: 100%; height: 500px;">
+</iframe>
+```
+
+---
+
 ## API Reference
 ibox.host(iframeElement, targetOrigin)
 
