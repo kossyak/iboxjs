@@ -1,3 +1,7 @@
+/**
+ * ibox - Безопасная обертка над MessageChannel для связи Host <-> Iframe
+ * Поддерживает: Promise (call/response), Events (emit/on), Timeouts, Security Origin
+ */
 (function (root, factory) {
     if (typeof define === 'function' && define.amd) { define([], factory); }
     else if (typeof module === 'object' && module.exports) { module.exports = factory(); }
@@ -5,168 +9,199 @@
 }(typeof self !== 'undefined' ? self : this, function () {
     'use strict';
 
-    return {
-        host: function (iframeElement, targetOrigin) {
-            targetOrigin = targetOrigin || '*';
-            const channel = new MessageChannel();
-            const port = channel.port1;
-            const handlers = new Map();
-            const pendingCalls = new Map();
-            let callId = 0;
+    const MSG_READY = 'IBOX_READY';
+    const MSG_PORT = 'IBOX_PORT';
+    const DEFAULT_TIMEOUT = 10000;
+    const MAX_PENDING_CALLS = 1000;
 
-            const init = (e) => {
-                if (targetOrigin !== '*' && e.origin !== targetOrigin) return;
-                if (e.data !== 'IBOX_READY') return;
-                if (iframeElement && iframeElement.contentWindow) {
-                    iframeElement.contentWindow.postMessage('IBOX_PORT', targetOrigin, [channel.port2]);
-                    window.removeEventListener('message', init);
-                    port.start();
-                }
-            };
+    function validateEvent(event) {
+        if (typeof event !== 'string' || !event.trim()) {
+            throw new Error('ibox: Event name must be a non-empty string');
+        }
+        return event.trim();
+    }
 
-            window.addEventListener('message', init);
+    function createInterface(port, initialHandlers = new Map()) {
+        const handlers = initialHandlers;
+        const pendingCalls = new Map();
+        let callId = 0;
+        let isDestroyed = false;
 
-            const messageListener = async (e) => {
-                if (!e.data) return;
+        port.onmessage = async (e) => {
+            if (isDestroyed || !e.data) return;
+            const { event, data, _ibox_id, _ibox_res_id, _ibox_error } = e.data;
 
+            // 1. Обработка ответа на наш вызов (call)
+            if (_ibox_res_id && pendingCalls.has(_ibox_res_id)) {
+                const { resolve, reject } = pendingCalls.get(_ibox_res_id);
+                pendingCalls.delete(_ibox_res_id);
+                if (_ibox_error) reject(new Error(_ibox_error));
+                else resolve(data);
+                return;
+            }
 
-                if (e.data._ibox_res_id && pendingCalls.has(e.data._ibox_res_id)) {
-                    const resolve = pendingCalls.get(e.data._ibox_res_id);
-                    resolve(e.data.data);
-                    pendingCalls.delete(e.data._ibox_res_id);
-                    return;
-                }
+            // 2. Обработка входящего события
+            if (event && handlers.has(event)) {
+                const callbacks = handlers.get(event);
 
-
-                if (e.data.event && handlers.has(e.data.event)) {
-                    for (const cb of handlers.get(e.data.event)) {
-                        const result = await cb(e.data.data);
-                        if (e.data._ibox_id) {
-                            port.postMessage({ _ibox_res_id: e.data._ibox_id, data: result });
-                        }
+                if (_ibox_id) {
+                    // Режим CALL: берем первый обработчик и отправляем ответ
+                    const [firstHandler] = callbacks;
+                    if (!firstHandler) return;
+                    try {
+                        const result = await firstHandler(data);
+                        port.postMessage({ _ibox_res_id: _ibox_id, data: result });
+                    } catch (err) {
+                        port.postMessage({ _ibox_res_id: _ibox_id, _ibox_error: err.message });
+                    }
+                } else {
+                    // Режим EMIT: уведомляем всех подписчиков
+                    for (const cb of callbacks) {
+                        try { cb(data); } catch (err) { console.error(`ibox: Handler error [${event}]:`, err); }
                     }
                 }
-            };
+            }
+        };
 
-            port.onmessage = messageListener;
+        const api = {
+            emit: (event, data) => {
+                if (isDestroyed) throw new Error('ibox: Instance destroyed');
+                validateEvent(event);
+                port.postMessage({ event, data });
+            },
 
-            return {
-                emit: function (event, data) {
-                    port.postMessage({ event, data });
-                },
-                call: function (event, data, timeout = 5000) {
-                    const id = ++callId;
-                    return new Promise((resolve, reject) => {
-                        const timer = setTimeout(() => {
-                            pendingCalls.delete(id);
-                            reject(new Error(`ibox: Timeout for event "${event}"`));
-                        }, timeout);
-                        pendingCalls.set(id, (res) => {
-                            clearTimeout(timer);
-                            resolve(res);
-                        });
-                        port.postMessage({ event, data, _ibox_id: id });
+            call: (event, data, timeout = DEFAULT_TIMEOUT) => {
+                if (isDestroyed) return Promise.reject(new Error('ibox: Instance destroyed'));
+                if (pendingCalls.size >= MAX_PENDING_CALLS) return Promise.reject(new Error('ibox: Busy'));
+
+                validateEvent(event);
+                const id = ++callId;
+
+                return new Promise((resolve, reject) => {
+                    const timer = setTimeout(() => {
+                        if (pendingCalls.delete(id)) {
+                            reject(new Error(`ibox: Timeout [${event}] after ${timeout}ms`));
+                        }
+                    }, timeout);
+
+                    pendingCalls.set(id, {
+                        resolve: (res) => { clearTimeout(timer); resolve(res); },
+                        reject: (err) => { clearTimeout(timer); reject(err); }
                     });
-                },
-                on: function (event, callback) {
-                    if (!handlers.has(event)) handlers.set(event, []);
-                    handlers.get(event).push(callback);
-                },
-                destroy: function () {
-                    port.close();
-                    window.removeEventListener('message', init);
-                    handlers.clear();
-                    pendingCalls.clear();
+
+                    try {
+                        port.postMessage({ event, data, _ibox_id: id });
+                    } catch (err) {
+                        pendingCalls.delete(id);
+                        clearTimeout(timer);
+                        reject(new Error('ibox: Send failed'));
+                    }
+                });
+            },
+
+            on: (event, cb) => {
+                validateEvent(event);
+                if (typeof cb !== 'function') throw new Error('ibox: Handler must be a function');
+                if (!handlers.has(event)) handlers.set(event, new Set());
+                handlers.get(event).add(cb);
+
+                // Возвращаем функцию отписки (unsub)
+                return () => api.off(event, cb);
+            },
+
+            off: (event, cb) => {
+                if (handlers.has(event)) {
+                    handlers.get(event).delete(cb);
+                    if (handlers.get(event).size === 0) handlers.delete(event);
                 }
-            };
+            },
+
+            destroy: () => {
+                if (isDestroyed) return;
+                isDestroyed = true;
+                port.close();
+                pendingCalls.forEach(p => p.reject(new Error('ibox: Connection destroyed')));
+                pendingCalls.clear();
+                handlers.clear();
+            }
+        };
+
+        return api;
+    }
+
+    return {
+        host: function (iframe, targetOrigin) {
+            if (!targetOrigin || targetOrigin === '*') console.warn('ibox: Insecure "*" origin');
+
+            return new Promise((resolve, reject) => {
+                if (!iframe?.contentWindow) return reject(new Error('ibox: No iframe'));
+
+                const channel = new MessageChannel();
+                const port1 = channel.port1;
+
+                const cleanup = () => {
+                    clearTimeout(timer);
+                    window.removeEventListener('message', init);
+                };
+
+                const timer = setTimeout(() => {
+                    cleanup();
+                    reject(new Error('ibox: Host connection timeout'));
+                }, 15000);
+
+                function init(e) {
+                    if (targetOrigin !== '*' && e.origin !== targetOrigin) return;
+                    if (e.data !== MSG_READY) return;
+                    cleanup();
+                    try {
+                        iframe.contentWindow.postMessage(MSG_PORT, targetOrigin, [channel.port2]);
+                        port1.start();
+                        resolve(createInterface(port1));
+                    } catch (err) { reject(err); }
+                }
+
+                window.addEventListener('message', init);
+            });
         },
 
         client: function (hostOrigin) {
-            hostOrigin = hostOrigin || '*';
+            if (!hostOrigin || hostOrigin === '*') console.warn('ibox: Insecure "*" origin');
+
             return new Promise((resolve, reject) => {
-                let handshakeInterval;
                 let attempts = 0;
-                const MAX_ATTEMPTS = 50;
-                const handlers = new Map();
-                const pendingCalls = new Map();
-                let callId = 0;
 
-                const getPort = (e) => {
-                    if (hostOrigin !== '*' && e.origin !== hostOrigin) return;
-                    if (e.data !== 'IBOX_PORT' || !e.ports || !e.ports[0]) return;
-
+                const cleanup = () => {
                     clearInterval(handshakeInterval);
+                    clearTimeout(timer);
                     window.removeEventListener('message', getPort);
-
-                    const port = e.ports[0];
-
-                    const messageListener = async (eventEvt) => {
-                        const data = eventEvt.data;
-                        if (!data) return;
-
-                        if (data._ibox_res_id && pendingCalls.has(data._ibox_res_id)) {
-                            const resCb = pendingCalls.get(data._ibox_res_id);
-                            resCb(data.data);
-                            pendingCalls.delete(data._ibox_res_id);
-                            return;
-                        }
-
-                        if (data.event && handlers.has(data.event)) {
-                            for (const cb of handlers.get(data.event)) {
-                                const result = await cb(data.data);
-                                if (data._ibox_id) {
-                                    port.postMessage({ _ibox_res_id: data._ibox_id, data: result });
-                                }
-                            }
-                        }
-                    };
-
-                    port.onmessage = messageListener;
-
-                    resolve({
-                        emit: function (event, data) {
-                            port.postMessage({ event, data });
-                        },
-                        call: function (event, data, timeout = 5000) {
-                            const id = ++callId;
-                            return new Promise((res, rej) => {
-                                const t = setTimeout(() => {
-                                    pendingCalls.delete(id);
-                                    rej(new Error(`ibox: Timeout for event "${event}"`));
-                                }, timeout);
-                                pendingCalls.set(id, (result) => {
-                                    clearTimeout(t);
-                                    res(result);
-                                });
-                                port.postMessage({ event, data, _ibox_id: id });
-                            });
-                        },
-                        on: function (event, callback) {
-                            if (!handlers.has(event)) handlers.set(event, []);
-                            handlers.get(event).push(callback);
-                        },
-                        destroy: function () {
-                            port.close();
-                            handlers.clear();
-                            pendingCalls.clear();
-                        }
-                    });
                 };
 
-                window.addEventListener('message', getPort);
-                handshakeInterval = setInterval(() => {
-                    attempts++;
-                    if (attempts > MAX_ATTEMPTS) {
-                        clearInterval(handshakeInterval);
-                        window.removeEventListener('message', getPort);
-                        reject(new Error('ibox: Connection timeout'));
+                const timer = setTimeout(() => {
+                    cleanup();
+                    reject(new Error('ibox: Client connection timeout'));
+                }, 15000);
+
+                const handshakeInterval = setInterval(() => {
+                    if (++attempts > 60) { // ~12 секунд
+                        cleanup();
+                        reject(new Error('ibox: Handshake failed'));
                         return;
                     }
-                    window.parent.postMessage('IBOX_READY', hostOrigin);
-                }, 100);
+                    try { window.parent.postMessage(MSG_READY, hostOrigin); } catch (e) {}
+                }, 200);
+
+                function getPort(e) {
+                    if (hostOrigin !== '*' && e.origin !== hostOrigin) return;
+                    if (e.data !== MSG_PORT || !e.ports || !e.ports[0]) return;
+
+                    cleanup();
+                    const port = e.ports[0];
+                    port.start();
+                    resolve(createInterface(port));
+                }
+
+                window.addEventListener('message', getPort);
             });
         }
     };
 }));
-
-
